@@ -55,13 +55,13 @@ def image_loss(estimate, target, args, target_norm=None, target_max=None):
     image = estimate_to_image(estimate, target.size()[-2:])
     image = image.reshape(-1, 1, image.size(-2), image.size(-1))
     target = target.reshape_as(image)
-    if args.loss == 'ssim':
+    if args.loss == 'ssim' and target_max is not None:
         normalizer = target_max
         for i in range(len(target.size()) - 1):
             normalizer = normalizer.unsqueeze(-1)
         target = target / normalizer
         image = image / normalizer
-    if args.loss == 'nmse':
+    if args.loss == 'nmse' and target_norm is not None:
         normalizer = target_norm
         for i in range(len(target.size()) - 1):
             normalizer = normalizer.unsqueeze(-1)
