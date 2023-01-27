@@ -1,7 +1,7 @@
 import torch
 from torch.nn import functional as F
 
-from fastMRI.data import transforms
+from external.fastMRI.data import transforms
 from training_utils import ssim
 
 

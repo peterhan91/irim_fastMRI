@@ -5,6 +5,9 @@ from external.invertible_rim.irim import IRIM, MemoryFreeInvertibleModule
 from external.invertible_rim.irim.rim import RIM
 
 from training_utils.helpers import complex_to_real, real_to_complex
+from utils import get_kspace, kspace_to_image
+
+from_space = lambda x: kspace_to_image(x, (2, 3)).real
 
 
 class RescaleByStd(object):
@@ -78,14 +81,19 @@ class IRIMfastMRI(torch.nn.Module):
         self.preprocessor = preprocessor
         self.multiplicity = multiplicity
 
-    def forward(self, y, mask, metadata=None):
+    def forward(self, ksp_y, mask_c, metadata=None):
         """
-        :param y: Zero-filled kspace reconstruction [Tensor]
+        :param ksp_y: Zero-filled kspace 
         :param mask: Sub-sampling mask
         :param metadata: Tensor with metadata
         :return: complex valued image estimate
         """
-        y, gamma = self.preprocessor.forward(y)
+        y = from_space(ksp_y)[:, :, :, :, None] # this is X_u zero-filled image
+        y = y.repeat(1, 1, 1, 1, 2)
+        mask = mask_c[:, :, 1].detach() # mask shape [1, 1, 256]
+        mask = mask[None, :, :, :, None].repeat(1, 1, 1, 1, 1) # assume batch size = 1
+
+        y, gamma = self.preprocessor.forward(y) # zero-filled reconstruction [Tensor]
         y = torch.cat(self.multiplicity*[y],1)
         eta = complex_to_real(y)
         x = torch.cat((eta, eta.new_zeros((eta.size(0), self.n_latent - eta.size(1)) + eta.size()[2:])), 1)
@@ -96,7 +104,7 @@ class IRIMfastMRI(torch.nn.Module):
 
             x[:, -metadata.size(1):] = metadata
 
-        x = self.model.forward(x, [y,mask])
+        x = self.model.forward(x, [y, mask])
         eta = self.output_function(x)
         eta = real_to_complex(eta)
         eta = self.preprocessor.reverse(eta, gamma)

@@ -16,6 +16,8 @@ import torch
 
 import torchvision
 from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from external.invertible_rim.irim.rim import RIM, ConvRNN
 from external.invertible_rim.irim import IRIM, InvertibleUnet, ResidualBlockPixelshuffle
@@ -37,11 +39,20 @@ torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
 
 
-def train_epoch(args, epoch, model, data_ds, optimizer, writer):
+def init_dist(backend='nccl', **kwargs):
+    ''' initialization for distributed training'''
+    rank = int(os.environ['RANK'])
+    num_gpus = torch.cuda.device_count()
+    torch.cuda.set_device(rank % num_gpus)
+    dist.init_process_group(backend=backend, **kwargs)
+
+
+def train_epoch(args, epoch, model, data_ds, optimizer, writer=None):
     model.train()
     avg_loss = 0.
     start_epoch = start_iter = time.perf_counter()
     mask_c = get_cartesian_mask([args.resolution, args.resolution], args.n_keep)
+    print('R = ', str(256 // args.n_keep))
     mask_c = torch.from_numpy(mask_c[None, None, :, :].astype(np.float32))
     n_steps = args.n_iters
     global_step = epoch * n_steps
@@ -57,6 +68,7 @@ def train_epoch(args, epoch, model, data_ds, optimizer, writer):
         target = torch.from_numpy(target.reshape(-1, 1, args.resolution, args.resolution).astype(np.float32))
         y = from_space(get_kspace(target, axes=(2, 3)) * mask_c)[:, :, :, :, None]
         y = y.repeat(1, 1, 1, 1, 2)
+        # y = torch.cat((y, torch.zeros_like(y)), dim=-1)
         mask = mask_c[:, :, 1].clone() # mask shape [1, 1, 256]
         mask = mask[None, :, :, :, None].repeat(args.batch_size, 1, 1, 1, 1)
         target = target.reshape((-1, args.resolution, args.resolution))
@@ -68,6 +80,7 @@ def train_epoch(args, epoch, model, data_ds, optimizer, writer):
         optimizer.zero_grad()
         model.zero_grad()
         estimate = model.forward(y=y, mask=mask, metadata=None)
+        # print('target: ', target.shape, 'estimate: ', estimate.shape)
         if isinstance(estimate, list):
             loss = [image_loss(e, target, args) for e in estimate]
             loss = sum(loss) / len(loss)
@@ -77,30 +90,31 @@ def train_epoch(args, epoch, model, data_ds, optimizer, writer):
         loss.backward()
         optimizer.step()
 
-        avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if i > 0 else loss.item()
-        writer.add_scalar('Loss', loss.item(), global_step + i)
+        avg_loss = 0.99 * avg_loss + 0.01 * loss.item() if i > 0 else loss.item()           
 
         if args.device == 'cuda':
             memory_allocated.append(torch.cuda.max_memory_allocated() * 1e-6)
             torch.cuda.reset_max_memory_allocated()
             torch.cuda.empty_cache()
         gc.collect()
-
-        if i % args.report_interval == 0:
-            logging.info(
-                f'Epoch = [{epoch:3d}/{args.num_epochs:3d}] '
-                f'Iter = [{i:4d}/{n_steps:4d}] '
-                f'Loss = {loss.detach().item():.4g} Avg Loss = {avg_loss:.4g} '
-                f'Time = {time.perf_counter() - start_iter:.4f}s '
-                f'Memory allocated (MB) = {np.min(memory_allocated):.2f}'
-            )
-            memory_allocated = []
-        start_iter = time.perf_counter()
-        i+=1
-        if i > n_steps:
-            break
+        
+        if dist.get_rank() == 0 and writer is not None:
+            writer.add_scalar('Loss', loss.item(), global_step + i)
+            if i % args.report_interval == 0:
+                logging.info(
+                    f'Epoch = [{epoch:3d}/{args.num_epochs:3d}] '
+                    f'Iter = [{i:4d}/{n_steps:4d}] '
+                    f'Loss = {loss.detach().item():.4g} Avg Loss = {avg_loss:.4g} '
+                    f'Time = {time.perf_counter() - start_iter:.4f}s '
+                    f'Memory allocated (MB) = {np.min(memory_allocated):.2f}'
+                )
+                memory_allocated = []
+            start_iter = time.perf_counter()
+            i+=1
+            if i > n_steps:
+                break
+    
     optimizer.zero_grad()
-
     return avg_loss, time.perf_counter() - start_epoch
 
 
@@ -126,6 +140,7 @@ def evaluate(args, epoch, model, data_ds, writer):
             target = torch.from_numpy(target.reshape(-1, 1, args.resolution, args.resolution).astype(np.float32))
             y = from_space(get_kspace(target, axes=(2, 3)) * mask_c)[:, :, :, :, None]
             y = y.repeat(1, 1, 1, 1, 2)
+            # y = torch.cat((y, torch.zeros_like(y)), dim=-1)
             mask = mask_c[:, :, 1].clone() # mask shape [1, 1, 256]
             mask = mask[None, :, :, :, None].repeat(args.batch_size, 1, 1, 1, 1)
             target = target.reshape((-1, args.resolution, args.resolution))
@@ -205,6 +220,7 @@ def visualize(args, epoch, model, data_ds, writer):
             target = torch.from_numpy(target.reshape(-1, 1, args.resolution, args.resolution).astype(np.float32))
             y = from_space(get_kspace(target, axes=(2, 3)) * mask_c)[:, :, :, :, None]
             y = y.repeat(1, 1, 1, 1, 2)
+            # y = torch.cat((y, torch.zeros_like(y)), dim=-1)
             mask = mask_c[:, :, 1].clone() # mask shape [1, 1, 256]
             mask = mask[None, :, :, :, None].repeat(args.batch_size, 1, 1, 1, 1)
             target = target.reshape((-1, args.resolution, args.resolution))
@@ -233,8 +249,8 @@ def visualize(args, epoch, model, data_ds, writer):
                     estimate_to_image(estimate[..., n_slices // 2, :, :, :],
                                       target.size()[-2:]).clone().detach() / target_norm)
             else:
+                output_images.append(estimate_to_image(estimate).clone().detach() / target_norm)
                 # output_images.append(estimate_to_image(estimate, target.size()[-2:]).clone().detach() / target_norm)
-                output_images.append(estimate[:, 0, :, :, 0].clone().detach() / target_norm)
             i+=1
             if i > 3:
                 break
@@ -302,11 +318,12 @@ def build_model(args):
 
 
 def load_model(checkpoint_file):
-    checkpoint = torch.load(checkpoint_file)
+    device_id = torch.cuda.current_device()
+    checkpoint = torch.load(checkpoint_file, map_location=lambda storage, loc: storage.cuda(device_id))
     args = checkpoint['args']
     model = build_model(args)
-    if args.data_parallel:
-        model = torch.nn.DataParallel(model)
+    # if args.data_parallel:
+    #     model = torch.nn.DataParallel(model)
     model.load_state_dict(checkpoint['model'])
 
     optimizer = build_optim(args, model.parameters())
@@ -326,8 +343,7 @@ def build_optim(args, params):
 
 def main(args):
     args.exp_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=args.exp_dir / 'summary')
-
+    device = torch.device('cuda')
     checkpoint_pretrained = os.path.join(args.exp_dir, 'pretrained.pt')
     if args.checkpoint is None:
         checkpoint_path = os.path.join(args.exp_dir, 'model.pt')
@@ -341,9 +357,10 @@ def main(args):
         start_epoch = checkpoint['epoch'] + 1
         del checkpoint
     else:
-        model = build_model(args)
+        model = build_model(args).to(device)
         if args.data_parallel:
-            model = torch.nn.DataParallel(model)
+            # model = torch.nn.DataParallel(model)
+            model = DistributedDataParallel(model, device_ids=[torch.cuda.current_device()])
         optimizer = build_optim(args, model.parameters())
         if os.path.exists(checkpoint_pretrained):
             _, model, optimizer = load_model(checkpoint_pretrained)
@@ -356,22 +373,25 @@ def main(args):
     # train_loader, val_loader, display_loader = create_training_loaders(args)
     train_ds, eval_ds, _ = get_dataset(args, additional_dim=1, uniform_dequantization=False)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_step_size, args.lr_gamma)
-
+    # if rank <= 0:
+    writer = SummaryWriter(log_dir=args.exp_dir / 'summary')
     for epoch in range(start_epoch, args.num_epochs):
         train_loss, train_time = train_epoch(args, epoch, model, train_ds, optimizer, writer)
-        nmse_loss, psnr_loss, mse_loss, ssim_loss, dev_time, dev_mem = evaluate(args, epoch, model, eval_ds, writer)
-        visualize(args, epoch, model, eval_ds, writer)
         scheduler.step(epoch)
-
-        is_new_best = -ssim_loss < best_dev_loss
-        best_dev_loss = min(best_dev_loss, ssim_loss)
-        save_model(args, args.exp_dir, epoch, model, optimizer, best_dev_loss, is_new_best)
-        logging.info(
-            f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
-            f'VAL_NMSE = {nmse_loss:.4g} VAL_MSE = {mse_loss:.4g} VAL_PSNR = {psnr_loss:.4g} '
-            f'VAL_SSIM = {ssim_loss:.4g} \n'
-            f'TrainTime = {train_time:.4f}s ValTime = {dev_time:.4f}s ValMemory = {dev_mem:.2f}',
-        )
+        if dist.get_rank() == 0:
+            nmse_loss, psnr_loss, mse_loss, ssim_loss, dev_time, dev_mem = evaluate(args, epoch, model, eval_ds, writer)
+            visualize(args, epoch, model, eval_ds, writer)
+        
+            is_new_best = -ssim_loss < best_dev_loss
+            best_dev_loss = min(best_dev_loss, ssim_loss)
+            save_model(args, args.exp_dir, epoch, model, optimizer, best_dev_loss, is_new_best)
+            logging.info(
+                f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
+                f'VAL_NMSE = {nmse_loss:.4g} VAL_MSE = {mse_loss:.4g} VAL_PSNR = {psnr_loss:.4g} '
+                f'VAL_SSIM = {ssim_loss:.4g} \n'
+                f'TrainTime = {train_time:.4f}s ValTime = {dev_time:.4f}s ValMemory = {dev_mem:.2f}',
+            )
+        
         if args.exit_after_checkpoint:
             writer.close()
             sys.exit(0)
@@ -392,7 +412,7 @@ def create_arg_parser():
     parser.add_argument('--random_flip', action='store_true')
 
     parser.add_argument('--num_epochs', type=int, default=50, help='Number of training epochs')
-    parser.add_argument('--n_iters', type=int, default=10000, help='Number of training iterations per epoch')
+    parser.add_argument('--n_iters', type=int, default=5000, help='Number of training iterations per epoch')
     parser.add_argument('--use_rim', action='store_true',
                         help='If set, RIM with fixed parameters')
     parser.add_argument('--optimizer', type=str, default='Adam', help="Optimizer to use choose between"
@@ -402,23 +422,23 @@ def create_arg_parser():
     parser.add_argument('--use_rss', action='store_true',
                         help='If set, will train singlecoil model with RSS targets')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--lr_step_size', type=int, default=40, help='Period of learning rate decay')
+    parser.add_argument('--lr_step_size', type=int, default=30, help='Period of learning rate decay')
     parser.add_argument('--lr_gamma', type=float, default=0.1, help='Multiplicative factor of learning rate decay')
     parser.add_argument('--n_steps', type=int, default=8, help='Number of RIM steps')
     parser.add_argument('--weight_decay', type=float, default=0.,
                         help='Strength of weight decay regularization')
     parser.add_argument('--shared_weights', action='store_true',
                         help='If set, weights will be shared over time steps. (only relevant for IRIM)')
-    parser.add_argument('--n_hidden', type=int, nargs='+', help='Number of hidden features in each layer. Can'
-                                                                'be either Int or List of Ints')
-    parser.add_argument('--n_network_hidden', type=int, nargs='+', help='Number of hidden features in each layer. Can'
-                                                                        'be either Int or List of Ints')
-    parser.add_argument('--dilations', type=int, nargs='+', help='Kernel dilations in each in each layer. Can'
-                                                                 'be either Int or List of Ints')
+    parser.add_argument('--n_hidden', type=int, nargs='+', default=[64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64], 
+                        help='Number of hidden features in each layer. Can be either Int or List of Ints')
+    parser.add_argument('--n_network_hidden', type=int, nargs='+', default=[64, 64, 128, 128, 256, 1024, 1024, 256, 128, 128, 64, 64],
+                        help='Number of hidden features in each layer. Can be either Int or List of Ints')
+    parser.add_argument('--dilations', type=int, nargs='+', default=[1, 1, 2, 2, 4, 8, 8, 4, 2, 2, 1, 1],
+                        help='Kernel dilations in each in each layer. Can be either Int or List of Ints')
     parser.add_argument('--depth', type=int, help='Number of RNN layers.')
     
-    parser.add_argument('--report_interval', type=int, default=100, help='Period of loss reporting')
-    parser.add_argument('--data_parallel', action='store_false',
+    parser.add_argument('--report_interval', type=int, default=200, help='Period of loss reporting')
+    parser.add_argument('--data_parallel', action='store_true',
                         help='If set, use multiple GPUs using data parallelism')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Which device to train on. Set to "cuda" to use the GPU')
@@ -429,13 +449,16 @@ def create_arg_parser():
                              '"--checkpoint" should be set with this')
     parser.add_argument('--checkpoint', type=str,
                         help='Path to an existing checkpoint. Used along with "--resume"')
-    parser.add_argument('--multiplicity', type=int, default=1,
+    parser.add_argument('--multiplicity', type=int, default=4,
                         help='Number of eta estimates at every time step. The higher multiplicity, the lower the '
                              'number of necessary time steps would be expected.')
     # parser.add_argument('--train_resolution', type=int, nargs=2, default=None, help='Image resolution during training')
     parser.add_argument('--parametric_output', action='store_true', help='Use a parametric function for map the'
                                                                          'last layer of the iRIM to an image estimate')
     parser.add_argument('--exit_after_checkpoint', action='store_true')
+    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--dist', type=bool, default=False)
+    parser.add_argument('--launcher', choices=['none', 'pytorch'], default='pytorch', help='job launcher')
 
     return parser
 
@@ -445,4 +468,15 @@ if __name__ == '__main__':
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    #### distributed training settings ####
+    if args.launcher == 'none':  # disabled distributed training
+        args.dist = False
+        rank = -1
+        print('Disabled distributed training.')
+    else:
+        args.dist = True
+        init_dist()
+        world_size = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+
     main(args)

@@ -1,7 +1,6 @@
 import numpy as np
 import torch.fft as fft
 
-
 def get_cartesian_mask(shape, n_keep=30):
   # shape [Tuple]: (H, W)
   size = shape[0]
@@ -26,8 +25,7 @@ def get_cartesian_mask(shape, n_keep=30):
 def get_kspace(img, axes):
   # img should be a complex tensor
   shape = img.shape[axes[0]]
-  return fft.fftshift(
-    fft.fftn(fft.ifftshift(
+  return fft.fftshift(fft.fftn(fft.ifftshift(
       img, dim=axes
     ), dim=axes),
     dim=axes
@@ -36,8 +34,7 @@ def get_kspace(img, axes):
 
 def kspace_to_image(kspace, axes):
   shape = kspace.shape[axes[0]]
-  return fft.fftshift(
-    fft.ifftn(fft.ifftshift(
+  return fft.fftshift(fft.ifftn(fft.ifftshift(
       kspace, dim=axes
     ), dim=axes),
     dim=axes

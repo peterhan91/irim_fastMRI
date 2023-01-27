@@ -1,8 +1,12 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+*/__pycache__/
 *.py[cod]
 *$py.class
 test/
+test_irim_R=4/
+eval_*/
+checkpoints/
 
 # C extensions
 *.so
